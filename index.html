@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>オンライン・マリオ風アクション</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    body {
+      margin: 0;
+      padding: 0;
+      background: #222;
+      color: #fff;
+      font-family: sans-serif;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+    #game-container {
+      position: relative;
+      width: 100vw;
+      max-width: 800px;
+      height: 60vh;
+      max-height: 400px;
+      background: #5c94fc;
+      overflow: hidden;
+      border: 2px solid #fff;
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    /* スマホ用操作ボタン */
+    #touch-controls {
+      width: 100vw;
+      max-width: 800px;
+      height: 35vh;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 20px;
+      box-sizing: border-box;
+    }
+    .d-pad, .action-pad {
+      display: flex;
+      gap: 15px;
+    }
+    .btn {
+      width: 65px;
+      height: 65px;
+      background: rgba(255, 255, 255, 0.3);
+      border: 2px solid #fff;
+      border-radius: 50%;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-size: 24px;
+      font-weight: bold;
+      color: #fff;
+      touch-action: manipulation;
+    }
+    .btn:active {
+      background: rgba(255, 255, 255, 0.6);
+    }
+    #status {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: rgba(0,0,0,0.5);
+      padding: 5px 10px;
+      border-radius: 5px;
+      font-size: 14px;
+    }
+  </style>
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+</head>
+<body>
+
+  <div id="game-container">
+    <canvas id="canvas" width="800" height="400"></canvas>
+    <div id="status">接続中...</div>
+  </div>
+
+  <div id="touch-controls">
+    <div class="d-pad">
+      <div class="btn" id="btn-left">◀</div>
+      <div class="btn" id="btn-right">▶</div>
+    </div>
+    <div class="action-pad">
+      <div class="btn" id="btn-jump">ジャンプ</div>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+
+    // プレイヤー定義
+    let myId = null;
+    let players = {};
+    const localPlayer = {
+      x: 100,
+      y: 200,
+      vx: 0,
+      vy: 0,
+      width: 30,
+      height: 40,
+      color: '#ff2222', // 赤（マリオ色）
+      isGrounded: false
+    };
+
+    // 操作状態
+    const input = { left: false, right: false, jump: false };
+
+    // ステージ（ブロック）のデータ
+    const platforms = [
+      { x: 0, y: 350, w: 2000, h: 50 }, // 地面
+      { x: 200, y: 250, w: 100, h: 20 },
+      { x: 350, y: 180, w: 80, h: 20 },
+      { x: 500, y: 250, w: 120, h: 20 }
+    ];
+
+    // ----- PeerJS によるオンライン同期設定 -----
+    // 同じルーム名で接続を共有
+    const ROOM_PREFIX = 'mario-online-room-demo-12345';
+    let peer = null;
+    let connections = [];
+
+    function initNetwork() {
+      // 誰でも同じURLで繋がるよう、固定のホストに接続するか自らホストになる処理
+      peer = new Peer();
+
+      peer.on('open', (id) => {
+        myId = id;
+        statusEl.innerText = "オンライン（ID: " + id.substring(0, 5) + "）";
+        
+        // ホスト（ルーム主）への接続を試みる
+        const hostConn = peer.connect(ROOM_PREFIX + '-host');
+        setupConnection(hostConn);
+
+        // 自分がホストになれるよう準備
+        if (!hostConn) {
+          const hostPeer = new Peer(ROOM_PREFIX + '-host');
+          hostPeer.on('connection', (c) => setupConnection(c));
+        }
+      });
+
+      peer.on('connection', (c) => setupConnection(c));
+
+      // ホスト登録失敗時のフォールバック（既にホストがいる場合）
+      peer.on('error', (err) => {
+        if (err.type === 'unavailable-id') {
+          // すでにホストが存在するので、クライアントとして接続
+          const conn = peer.connect(ROOM_PREFIX + '-host');
+          setupConnection(conn);
+        }
+      });
+    }
+
+    function setupConnection(conn) {
+      conn.on('open', () => {
+        connections.push(conn);
+        statusEl.innerText = "マルチプレイ接続成功！";
+      });
+
+      conn.on('data', (data) => {
+        // 他プレイヤーの位置情報を更新
+        if (data.id && data.id !== myId) {
+          players[data.id] = data.state;
+        }
+      });
+
+      conn.on('close', () => {
+        connections = connections.filter(c => c !== conn);
+      });
+    }
+
+    function broadcastState() {
+      const state = {
+        x: localPlayer.x,
+        y: localPlayer.y,
+        color: localPlayer.color
+      };
+      connections.forEach(conn => {
+        if (conn.open) {
+          conn.send({ id: myId, state: state });
+        }
+      });
+    }
+
+    // ----- タップ＆キーボード操作処理 -----
+    function setupInputs() {
+      const bindTouch = (id, key) => {
+        const btn = document.getElementById(id);
+        btn.addEventListener('touchstart', (e) => { e.preventDefault(); input[key] = true; });
+        btn.addEventListener('touchend', (e) => { e.preventDefault(); input[key] = false; });
+        btn.addEventListener('mousedown', () => { input[key] = true; });
+        btn.addEventListener('mouseup', () => { input[key] = false; });
+      };
+
+      bindTouch('btn-left', 'left');
+      bindTouch('btn-right', 'right');
+      bindTouch('btn-jump', 'jump');
+
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowLeft' || e.key === 'a') input.left = true;
+        if (e.key === 'ArrowRight' || e.key === 'd') input.right = true;
+        if (e.key === 'ArrowUp' || e.key === ' ' || e.key === 'w') input.jump = true;
+      });
+
+      window.addEventListener('keyup', (e) => {
+        if (e.key === 'ArrowLeft' || e.key === 'a') input.left = false;
+        if (e.key === 'ArrowRight' || e.key === 'd') input.right = false;
+        if (e.key === 'ArrowUp' || e.key === ' ' || e.key === 'w') input.jump = false;
+      });
+    }
+
+    // ----- 物理演算・更新処理 -----
+    function update() {
+      // 左右移動
+      if (input.left) localPlayer.vx = -4;
+      else if (input.right) localPlayer.vx = 4;
+      else localPlayer.vx = 0;
+
+      // ジャンプ（タップ/キー押し下げ時かつ接地中）
+      if (input.jump && localPlayer.isGrounded) {
+        localPlayer.vy = -12;
+        localPlayer.isGrounded = false;
+      }
+
+      // 重力
+      localPlayer.vy += 0.6;
+
+      // 位置更新
+      localPlayer.x += localPlayer.vx;
+      localPlayer.y += localPlayer.vy;
+
+      // ブロック・地面との当たり判定
+      localPlayer.isGrounded = false;
+      for (let p of platforms) {
+        if (
+          localPlayer.x + localPlayer.width > p.x &&
+          localPlayer.x < p.x + p.w &&
+          localPlayer.y + localPlayer.height >= p.y &&
+          localPlayer.y + localPlayer.height <= p.y + p.h &&
+          localPlayer.vy >= 0
+        ) {
+          localPlayer.y = p.y - localPlayer.height;
+          localPlayer.vy = 0;
+          localPlayer.isGrounded = true;
+        }
+      }
+
+      // 画面外落下時の復帰
+      if (localPlayer.y > 500) {
+        localPlayer.x = 100;
+        localPlayer.y = 100;
+        localPlayer.vy = 0;
+      }
+
+      // 自分の位置を通信で送信
+      if (myId) {
+        broadcastState();
+      }
+    }
+
+    // ----- 描画処理 -----
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // カメラ追従（自分を中心に配置）
+      const cameraX = localPlayer.x - canvas.width / 2 + localPlayer.width / 2;
+
+      ctx.save();
+      ctx.translate(-cameraX, 0);
+
+      // 足場・ブロック描画
+      ctx.fillStyle = '#8b4513';
+      for (let p of platforms) {
+        ctx.fillRect(p.x, p.y, p.w, p.h);
+      }
+
+      // 他プレイヤー描画（青系で表示）
+      for (let id in players) {
+        const p = players[id];
+        ctx.fillStyle = '#0055ff';
+        ctx.fillRect(p.x, p.y, 30, 40);
+      }
+
+      // 自分のプレイヤー描画（赤）
+      ctx.fillStyle = localPlayer.color;
+      ctx.fillRect(localPlayer.x, localPlayer.y, localPlayer.width, localPlayer.height);
+
+      ctx.restore();
+    }
+
+    // ゲームループ
+    function loop() {
+      update();
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    // 初期化実行
+    setupInputs();
+    initNetwork();
+    loop();
+  </script>
+</body>
+</html>
